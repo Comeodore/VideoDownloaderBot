@@ -53,6 +53,7 @@ class MediaItem:
 class DownloadResult:
     items: list[MediaItem] = field(default_factory=list)
     title: str = "video"
+    description: str = ""
     total_size: int = 0
 
 
@@ -241,7 +242,21 @@ def _download_blocking(
             f"{config.max_file_size_mb} MB limit."
         )
 
-    return DownloadResult(items=items, title=info.get("title") or "video", total_size=total)
+    # Текст поста: у одиночных видео лежит в description; у плейлистов (карусели)
+    # yt-dlp может держать его только в элементах — берём из первого непустого.
+    description = info.get("description") or ""
+    if not description:
+        for entry in info.get("entries") or []:
+            if entry and entry.get("description"):
+                description = entry["description"]
+                break
+
+    return DownloadResult(
+        items=items,
+        title=info.get("title") or "video",
+        description=description,
+        total_size=total,
+    )
 
 
 async def download(

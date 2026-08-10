@@ -15,7 +15,7 @@ import signal
 import tempfile
 import time
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, html
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
@@ -251,40 +251,71 @@ def _chunks(items: list, n: int):
         yield items[i : i + n]
 
 
+# Лимит Telegram на caption. Считается в UTF-16 code units (эмодзи = 2 юнита),
+# поэтому режем не по len(), а по юнитам.
+CAPTION_LIMIT = 1024
+
+
+def _truncate_utf16(text: str, limit: int = CAPTION_LIMIT) -> str:
+    units = 0
+    for i, ch in enumerate(text):
+        units += 2 if ord(ch) > 0xFFFF else 1
+        if units > limit - 1:  # -1: запас под «…»
+            return text[:i] + "…"
+    return text
+
+
+def _caption_for(result: downloader.DownloadResult) -> str | None:
+    """Текст поста для caption: description (полный текст), иначе title."""
+    text = (result.description or "").strip() or (result.title or "").strip()
+    if not text or text == "video":
+        return None
+    # Пост может содержать <, > и & — экранируем, т.к. бот шлёт в HTML parse mode.
+    return html.quote(_truncate_utf16(text))
+
+
 async def _send_media(message: Message, result: downloader.DownloadResult) -> None:
     items = result.items
+    caption = _caption_for(result)
 
     if len(items) == 1:
-        await _send_single(message, items[0])
+        await _send_single(message, items[0], caption)
         return
 
     # Слайдшоу / карусель — отправляем альбомами по 10 (лимит Telegram).
+    # Caption вешаем только на первый элемент первого альбома — Telegram
+    # показывает его под всем альбомом.
     for chunk in _chunks(items, 10):
         if len(chunk) == 1:
-            await _send_single(message, chunk[0])
+            await _send_single(message, chunk[0], caption)
+            caption = None
             continue
         media = []
         for it in chunk:
             f = FSInputFile(it.path)
             media.append(
-                InputMediaVideo(media=f, supports_streaming=True)
+                InputMediaVideo(media=f, caption=caption, supports_streaming=True)
                 if it.is_video
-                else InputMediaPhoto(media=f)
+                else InputMediaPhoto(media=f, caption=caption)
             )
+            caption = None
         await message.answer_media_group(media=media)
 
 
-async def _send_single(message: Message, it: downloader.MediaItem) -> None:
+async def _send_single(
+    message: Message, it: downloader.MediaItem, caption: str | None = None
+) -> None:
     if it.is_video:
         await message.answer_video(
             video=FSInputFile(it.path, filename="video.mp4"),
+            caption=caption,
             duration=it.duration,
             width=it.width,
             height=it.height,
             supports_streaming=True,
         )
     else:
-        await message.answer_photo(photo=FSInputFile(it.path))
+        await message.answer_photo(photo=FSInputFile(it.path), caption=caption)
 
 
 async def _safe_edit(status: Message, text: str) -> None:
