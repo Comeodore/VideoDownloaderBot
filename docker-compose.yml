@@ -1,0 +1,80 @@
+# VideoDownloaderBot — деплой на сервер.
+# Каталог данных VIDEODL_DATA_DIR (задаётся в .env) монтируется в ОБА контейнера
+# по одинаковому пути /var/lib/telegram-bot-api → Bot API server отдаёт файл
+# по пути (path-режим, до 2 ГБ).
+
+services:
+  # ── Локальный Telegram Bot API server (снимает лимит 50 МБ → до 2 ГБ) ──
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: videodl-bot-api-1
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: "true"               # local-режим: чтение файлов с диска по пути
+    volumes:
+      - ${VIDEODL_DATA_DIR:-./data}:/var/lib/telegram-bot-api
+    networks:
+      - videodl
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Сам бот ──
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: videodl-bot:latest
+    container_name: videodl-bot-1
+    restart: unless-stopped
+    env_file: ./.env
+    environment:
+      TELEGRAM_API_BASE: http://telegram-bot-api:8081
+      DOWNLOAD_DIR: /var/lib/telegram-bot-api/downloads
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-1900}
+      YTDLP_AUTO_UPDATE_HOURS: ${YTDLP_AUTO_UPDATE_HOURS:-24}
+      COOKIES_FILE: ${COOKIES_FILE:-}
+    depends_on:
+      - telegram-bot-api
+    volumes:
+      # ТОТ ЖЕ каталог и ТОТ ЖЕ путь, что у сервера — иначе path-режим не найдёт файл
+      - ${VIDEODL_DATA_DIR:-./data}:/var/lib/telegram-bot-api
+    networks:
+      - videodl
+    labels:
+      # Образ собирается локально (build:.), в registry его нет — Watchtower его не трогает.
+      # yt-dlp бот обновляет сам (self-restart), код/образ — пересборкой.
+      com.centurylinklabs.watchtower.enable: "false"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Watchtower: авто-обновление образов (только помеченных enable=true) ──
+  # Форк nickfedor — оригинальный containrrr заброшен и не работает с Docker API ≥1.44.
+  watchtower:
+    image: nickfedor/watchtower:latest
+    container_name: videodl-watchtower-1
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_POLL_INTERVAL: "86400"     # раз в сутки
+      WATCHTOWER_LABEL_ENABLE: "true"       # ТОЛЬКО контейнеры с меткой enable=true
+      WATCHTOWER_INCLUDE_RESTARTING: "true"
+    networks:
+      - videodl
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+
+networks:
+  videodl:
+    driver: bridge
