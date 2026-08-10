@@ -1,7 +1,7 @@
 # 🎬 Video Downloader Bot
 
 Телеграм-бот: присылаешь ссылку — получаешь видео.
-Поддержка **TikTok (без вотермарки)**, **YouTube Shorts**, **Instagram Reels**.
+Поддержка **TikTok (без вотермарки)**, **YouTube Shorts**, **Instagram Reels**, **Threads**.
 
 Стек: [aiogram 3](https://aiogram.dev/) (async) + [yt-dlp](https://github.com/yt-dlp/yt-dlp) + ffmpeg.
 
@@ -75,7 +75,7 @@ ssh root@YOUR_SERVER 'cd /path/to/videodl-bot && docker compose up -d --build'
 ### Передеплой после правок кода
 
 ```bash
-scp bot.py downloader.py config.py root@YOUR_SERVER:/path/to/videodl-bot/
+scp -r bot.py downloader.py config.py yt_dlp_plugins root@YOUR_SERVER:/path/to/videodl-bot/
 ssh root@YOUR_SERVER 'cd /path/to/videodl-bot && docker compose up -d --build bot'
 ```
 
@@ -133,6 +133,7 @@ Instagram часто отвечает `login required` / rate-limit даже н�
 bot.py                — хендлеры aiogram, polling, плановый self-restart
 downloader.py         — обёртка yt-dlp (детекция ссылок, скачивание, лимиты)
 config.py             — загрузка .env
+yt_dlp_plugins/       — плагины yt-dlp (экстрактор Threads, пока его нет в апстриме)
 Dockerfile            — образ бота (python + ffmpeg)
 docker/entrypoint.sh  — апдейт yt-dlp при старте → запуск бота
 docker-compose.yml    — бот + локальный Bot API server + Watchtower

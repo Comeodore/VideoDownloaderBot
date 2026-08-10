@@ -46,7 +46,8 @@ WELCOME = (
     "👋 Hi! Send me a link to a video from:\n\n"
     "• TikTok\n"
     "• YouTube Shorts\n"
-    "• Instagram Reels\n\n"
+    "• Instagram Reels\n"
+    "• Threads\n\n"
     "I'll download it and send it back here.\n\n"
     "✂️ To cut clips, add timecodes after the link:\n"
     "<code>&lt;link&gt; 1:00-1:10, 2:10-2:55</code>\n"
@@ -135,7 +136,8 @@ async def handle_link(message: Message, config: Config) -> None:
 
     if not downloader.is_supported(url):
         await message.answer(
-            "This link isn't supported. I can do TikTok, YouTube Shorts and Instagram."
+            "This link isn't supported. I can do TikTok, YouTube Shorts, "
+            "Instagram and Threads."
         )
         return
 

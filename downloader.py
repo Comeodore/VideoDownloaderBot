@@ -1,4 +1,4 @@
-"""Обёртка над yt-dlp: скачивание видео/фото из TikTok / Instagram / YouTube Shorts.
+"""Обёртка над yt-dlp: скачивание видео/фото из TikTok / Instagram / YouTube Shorts / Threads.
 
 Поддерживает одиночные видео, фото и слайдшоу/карусели (несколько медиа в посте).
 """
@@ -30,6 +30,8 @@ SUPPORTED_PATTERNS = (
     r"youtube\.com/shorts",
     r"youtube\.com/watch",
     r"youtu\.be/",
+    r"threads\.com",
+    r"threads\.net",
 )
 _URL_RE = re.compile(r"https?://[^\s]+")
 
@@ -101,9 +103,9 @@ def _build_opts(config: Config, out_template: str, url: str) -> dict:
         "concurrent_fragment_downloads": 4,
         "max_filesize": config.max_file_size_bytes,
     }
-    # Карусели Instagram и фото-слайдшоу TikTok — это «плейлист» из нескольких медиа.
-    # Для них разрешаем до 10 элементов (лимит media group в Telegram).
-    if re.search(r"instagram|tiktok", url, re.IGNORECASE) and "youtube" not in url.lower():
+    # Карусели Instagram/Threads и фото-слайдшоу TikTok — это «плейлист» из
+    # нескольких медиа. Для них разрешаем до 10 элементов (лимит media group в Telegram).
+    if re.search(r"instagram|tiktok|threads\.", url, re.IGNORECASE) and "youtube" not in url.lower():
         opts["noplaylist"] = False
         opts["playlistend"] = 10
     # Передаём cookies только если файл реально есть (его могли ещё не загрузить).
