@@ -178,7 +178,7 @@ async def _handle_full(message: Message, config: Config, url: str) -> None:
         if result.total_size > 25 * 1024 * 1024:
             await _safe_edit(status, "⏳ Uploading…")
         try:
-            await _send_media(message, result)
+            await _send_media(message, result, url)
             await status.delete()
         except Exception:  # noqa: BLE001
             logger.exception("Не удалось отправить медиа")
@@ -274,9 +274,11 @@ def _caption_for(result: downloader.DownloadResult) -> str | None:
     return html.quote(_truncate_utf16(text))
 
 
-async def _send_media(message: Message, result: downloader.DownloadResult) -> None:
+async def _send_media(message: Message, result: downloader.DownloadResult, url: str) -> None:
     items = result.items
-    caption = _caption_for(result)
+    # Текст поста добавляем только для Threads — у остальных источников
+    # description обычно мусорный (хэштеги, авто-заголовки).
+    caption = _caption_for(result) if downloader.is_threads(url) else None
 
     if len(items) == 1:
         await _send_single(message, items[0], caption)

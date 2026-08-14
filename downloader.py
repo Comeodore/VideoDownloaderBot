@@ -78,6 +78,10 @@ def is_supported(url: str) -> bool:
     return any(re.search(p, url, re.IGNORECASE) for p in SUPPORTED_PATTERNS)
 
 
+def is_threads(url: str) -> bool:
+    return bool(re.search(r"threads\.(com|net)", url, re.IGNORECASE))
+
+
 def _to_int(value: object) -> int | None:
     try:
         return int(value) if value is not None else None
