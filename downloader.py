@@ -10,6 +10,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -80,6 +81,92 @@ def is_supported(url: str) -> bool:
 
 def is_threads(url: str) -> bool:
     return bool(re.search(r"threads\.(com|net)", url, re.IGNORECASE))
+
+
+# ── Подмена impersonate-таргета curl_cffi ───────────────────────────────────
+# TikTok-экстрактор просит «любой» таргет, и yt-dlp берёт первый из своей карты
+# (самый свежий Chrome). Площадки периодически банят конкретный TLS-отпечаток:
+# в ответ прилетает WAF-заглушка «Site Maintenance», и экстрактор падает с
+# «Unexpected response from webpage request». Поэтому перебираем браузеры сами.
+_IMPERSONATE_CLIENTS = ("firefox", "safari", "chrome")
+# Скачивания идут в разных потоках (asyncio.to_thread) — таргет попытки храним
+# в thread-local, иначе параллельные запросы перетирали бы выбор друг друга.
+_pinned = threading.local()
+
+
+def _install_impersonate_pinning() -> bool:
+    """Учит yt-dlp спрашивать наш таргет вместо «первого попавшегося».
+
+    Публичного API нет: параметр impersonate экстрактор перекрывает своим
+    wildcard-таргетом — поэтому патчим внутренний _resolve_target. yt-dlp
+    обновляется nightly на каждом старте, так что при любой неожиданности
+    молча остаёмся на дефолтном поведении.
+    """
+    try:
+        from yt_dlp.networking.impersonate import ImpersonateRequestHandler
+    except ImportError:
+        return False  # curl_cffi не установлен — impersonation не используется
+
+    original = ImpersonateRequestHandler._resolve_target
+
+    def _resolve_target(self, target):
+        pinned = getattr(_pinned, "target", None)
+        # Подменяем только wildcard (client=None); явно запрошенный таргет не трогаем.
+        if pinned is not None and target is not None and target.client is None:
+            return original(self, pinned) or original(self, target)
+        return original(self, target)
+
+    try:
+        ImpersonateRequestHandler._resolve_target = _resolve_target
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+_IMPERSONATE_PINNING = _install_impersonate_pinning()
+
+
+def _impersonate_candidates() -> list:
+    """Таргеты для попыток: по самому свежему на браузер + дефолт yt-dlp в конце."""
+    if not _IMPERSONATE_PINNING:
+        return [None]
+    try:
+        from yt_dlp.networking._curlcffi import CurlCFFIRH
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        available = {t.client for t in CurlCFFIRH.supported_targets}
+        return [ImpersonateTarget(c) for c in _IMPERSONATE_CLIENTS if c in available] + [None]
+    except Exception:  # noqa: BLE001
+        return [None]
+
+
+def _as_download_error(e: Exception) -> DownloadError:
+    msg = str(e)
+    low = msg.lower()
+    if "login" in low or "rate-limit" in low or "private" in low:
+        return DownloadError(
+            "Couldn't download: the content is private, requires login, or hit a "
+            "rate limit (common with Instagram). Fresh cookies are needed.",
+            auth=True,
+        )
+    return DownloadError(f"yt-dlp couldn't download it: {msg.splitlines()[-1]}")
+
+
+def _extract_info(opts: dict, url: str) -> dict:
+    """extract_info с перебором impersonate-таргетов (обычно хватает первого)."""
+    candidates = _impersonate_candidates()
+    for attempt, target in enumerate(candidates, start=1):
+        _pinned.target = target
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=True)
+        except yt_dlp.utils.DownloadError as e:
+            err = _as_download_error(e)
+            # Приватное/логин/лимит — отпечаток ни при чём, перебирать нечего.
+            if err.auth or attempt == len(candidates):
+                raise err from e
+        finally:
+            _pinned.target = None
+    raise DownloadError("yt-dlp couldn't download it")  # сюда не попадаем
 
 
 def _to_int(value: object) -> int | None:
@@ -200,19 +287,7 @@ def _download_blocking(
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except yt_dlp.utils.DownloadError as e:
-        msg = str(e)
-        low = msg.lower()
-        if "login" in low or "rate-limit" in low or "private" in low:
-            raise DownloadError(
-                "Couldn't download: the content is private, requires login, or hit a "
-                "rate limit (common with Instagram). Fresh cookies are needed.",
-                auth=True,
-            ) from e
-        raise DownloadError(f"yt-dlp couldn't download it: {msg.splitlines()[-1]}") from e
+    info = _extract_info(opts, url)
 
     files = _collect_media(work_dir)
     if not files:
@@ -295,19 +370,7 @@ def _download_full_blocking(
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except yt_dlp.utils.DownloadError as e:
-        msg = str(e)
-        low = msg.lower()
-        if "login" in low or "rate-limit" in low or "private" in low:
-            raise DownloadError(
-                "Couldn't download: the content is private, requires login, or hit a "
-                "rate limit (common with Instagram). Fresh cookies are needed.",
-                auth=True,
-            ) from e
-        raise DownloadError(f"yt-dlp couldn't download it: {msg.splitlines()[-1]}") from e
+    info = _extract_info(opts, url)
 
     videos = [f for f in _collect_media(work_dir) if os.path.splitext(f)[1].lower() in VIDEO_EXTS]
     if not videos:
