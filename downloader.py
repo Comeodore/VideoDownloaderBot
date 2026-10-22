@@ -51,7 +51,8 @@ _AAC_ARGS = ["-c:a", "aac", "-b:a", "160k"]
 _SITES = {
     "tiktok": ("tiktok.com",),
     "instagram": ("instagram.com", "instagr.am"),
-    "youtube": ("youtube.com", "youtu.be"),
+    # youtube-nocookie.com — «приватный» встроенный плеер на сайтах (/embed/).
+    "youtube": ("youtube.com", "youtu.be", "youtube-nocookie.com"),
     "threads": ("threads.com", "threads.net"),
 }
 
@@ -67,8 +68,23 @@ _ALLOWED_EXTRACTORS = [
     # номеру): yt-dlp подменяет ими свои экстракторы, и суффикс в имени есть.
     r"instagram(?:\+videobot)?", r"instagram:story(?:\+videobot)?",
     r"youtube", r"youtube:tab",              # tab — ролик, открытый из плейлиста
+    r"youtube:clip",                         # клипы YouTube (/clip/<id>)
     r"threads",                              # наш плагин
 ]
+
+# Ролики YouTube помимо /watch?v=: Shorts, встроенный плеер с сайтов (/embed/<id>)
+# и клипы (/clip/<id>). У /embed/ одиннадцать символов ещё у videoseries и
+# live_stream — это плейлист и эфир канала, их не берём.
+_YOUTUBE_VIDEO_PATH_RE = re.compile(
+    r"/(?:shorts/[\w-]+|embed/(?!videoseries|live_stream)[\w-]{11}|clip/[\w-]+)/?")
+
+# Прямые эфиры (и ещё не начавшиеся) не качаем: запись шла бы, пока эфир не
+# кончится, — часами, а у круглосуточных трансляций бесконечно, занимая слот.
+_LIVE_STATUSES = ("is_live", "is_upcoming")
+_LIVE_MESSAGE = (
+    "This is a live stream or a premiere that hasn't happened yet — I don't "
+    "download those. Send the link after it's over."
+)
 
 # Сколько медиа поста берём: фото-пост TikTok — до 35 картинок и музыка,
 # карусель Instagram — до 20. Бот шлёт их альбомами по 10 (лимит media group).
@@ -167,11 +183,15 @@ def site_of(url: str) -> str | None:
         for domain in domains:
             if host != domain and not host.endswith("." + domain):
                 continue
-            # С youtube.com берём только ролики (/shorts/<id>, /watch?v=<id>):
-            # канал или плейлист без v= выкачивался бы целиком.
+            # С youtube.com берём только ролики: канал или плейлист без v=
+            # выкачивался бы целиком. Записи эфиров (/live/<id>) не берём.
             if domain == "youtube.com" and not (
-                    parts.path.startswith("/shorts/")
+                    _YOUTUBE_VIDEO_PATH_RE.fullmatch(parts.path)
                     or (parts.path == "/watch" and parse_qs(parts.query).get("v"))):
+                return None
+            if domain == "youtube-nocookie.com" and not (
+                    parts.path.startswith("/embed/")
+                    and _YOUTUBE_VIDEO_PATH_RE.fullmatch(parts.path)):
                 return None
             return site
     return None
@@ -333,6 +353,9 @@ _ERROR_MESSAGES = (
      "or visible only to logged-in users."),
     (("has no photo or video",),
      "This post is text only — no photo or video in it."),
+    # Эфиры, которые YouTube не отдаёт сам (идущий без записи, будущая премьера).
+    (("live stream recording is not available", "live event will begin", "premieres in"),
+     _LIVE_MESSAGE),
     (("unsupported url", "no suitable extractor"),
      "This link doesn't point to a video or a post."),
     (("blocked from accessing", "ip address is blocked"),
@@ -569,6 +592,20 @@ def _cookies_for_run(config: Config, work_dir: str) -> str | None:
     return dst
 
 
+def _is_live(info: dict) -> bool:
+    return bool(info.get("is_live")) or info.get("live_status") in _LIVE_STATUSES
+
+
+def _skip_live(info: dict, *, incomplete: bool = False) -> str | None:
+    """match_filter для yt-dlp: эфир не качать (причину вернёт _reject_live)."""
+    return "live stream" if _is_live(info) else None
+
+
+def _reject_live(info: dict) -> None:
+    if _is_live(info):
+        raise DownloadError(_LIVE_MESSAGE)
+
+
 def _build_opts(config: Config, out_template: str, url: str, work_dir: str) -> dict:
     opts: dict = {
         # У вертикальных видео «1080p» = 1080x1920, т.е. height=1920 — поэтому
@@ -591,6 +628,8 @@ def _build_opts(config: Config, out_template: str, url: str, work_dir: str) -> d
         # Медиа одного поста, а заодно страховка: любой «плейлист» — не больше
         # MAX_POST_ITEMS, даже если площадка неожиданно отдаст список.
         "playlistend": MAX_POST_ITEMS,
+        # Эфир не скачивается вовсе; объяснение — в _reject_live после извлечения.
+        "match_filter": _skip_live,
     }
     # Карусели Instagram/Threads — это «плейлист» из нескольких медиа.
     if site_of(url) in ("instagram", "threads"):
@@ -694,6 +733,7 @@ def _download_blocking(
         opts["progress_hooks"] = [progress_hook]
 
     info = _extract_info(opts, url)
+    _reject_live(info)
 
     files = _collect_media(work_dir)
     if not files:
@@ -827,6 +867,7 @@ def _download_clips_blocking(
         opts["progress_hooks"] = [progress_hook]
 
     info = _extract_info(opts, url)
+    _reject_live(info)
 
     result = ClipsResult(
         duration=_to_int(info.get("duration")),
