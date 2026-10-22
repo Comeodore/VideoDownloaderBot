@@ -311,10 +311,10 @@ def _extract_info(opts: dict, url: str) -> dict:
         #
         # Повод — no_post (страницу поста не отдали): это и есть симптом
         # негодной сессии. И no_media: под сессией плагин берёт пост из
-        # приватного API, а там цитата может прийти без медиа процитированного
-        # поста, хотя гостевой HTML его отдаёт (так было с
-        # @margarita_oliverivna/post/Dev_Rq2Dva9: бот ответил «text only»,
-        # анонимно — видео из цитаты).
+        # приватного API, а там цитаты может не быть вовсе, хотя гостевой HTML
+        # её отдаёт вместе с видео. Проверено на
+        # @margarita_oliverivna/post/Dev_Rq2Dva9: API — media_type 19 и пустой
+        # share_info, ни code, ни pk процитированного поста во всём ответе.
         if (e.auth or not (e.no_post or e.no_media)
                 or not (is_threads(url) and opts.get("cookiefile"))):
             raise
