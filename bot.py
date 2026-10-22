@@ -47,16 +47,33 @@ HEARTBEAT_FILE = "/tmp/heartbeat"
 dp = Dispatcher()
 
 WELCOME = (
-    "👋 Hi! Send me a link to a video from:\n\n"
-    "• TikTok\n"
-    "• YouTube Shorts\n"
-    "• Instagram Reels\n"
-    "• Threads\n\n"
-    "I'll download it and send it back here — photos, carousels and TikTok "
-    "slideshows too.\n\n"
+    "👋 Hi! Send me a link and I'll send back the video or photos:\n\n"
+    "• TikTok — videos without watermark, photo slideshows + their music\n"
+    "• Instagram — Reels, posts, carousels, stories\n"
+    "• YouTube — Shorts and videos\n"
+    "• Threads — videos, photos, carousels\n\n"
     "✂️ To cut clips, add timecodes after the link:\n"
     "<code>&lt;link&gt; 1:00-1:10, 2:10-2:55</code>\n"
-    "Each range comes back as a separate video, in order."
+    # «30 min» — это MAX_CUT_SECONDS ниже.
+    "Each range comes back as a separate video (up to 30 min in total)."
+)
+
+# Профиль бота в Telegram: имя, описание (его видно в пустом чате до /start) и
+# короткое описание (профиль бота, его пересылка). Синхронизируем на старте
+# (см. _sync_profile) — тексты живут здесь, а не только в настройках Telegram.
+BOT_NAME = "Downloader: TikTok · Insta · YouTube · Threads"
+BOT_SHORT_DESCRIPTION = (
+    "Send a link — get the video, photos or slideshow from TikTok, Instagram, "
+    "YouTube and Threads. No watermark."
+)
+BOT_DESCRIPTION = (
+    "Downloads videos and posts from TikTok, Instagram, YouTube and Threads — "
+    "just send a link.\n\n"
+    "• TikTok — videos without watermark, photo slideshows with their music\n"
+    "• Instagram — Reels, posts, carousels, stories\n"
+    "• YouTube — Shorts and videos\n"
+    "• Threads — videos, photos, carousels\n\n"
+    "✂️ Cut clips: add timecodes after the link, e.g. 1:00-1:10, 2:10-2:55"
 )
 
 # Чтобы не спамить владельцу про cookies — не чаще раза в 6 часов. Начинаем с
@@ -585,6 +602,26 @@ def _start_watchdog() -> None:
     threading.Thread(target=watch, name="watchdog", daemon=True).start()
 
 
+async def _sync_profile(bot: Bot) -> None:
+    """Приводит имя и описания бота в Telegram к BOT_NAME/BOT_*DESCRIPTION.
+
+    Меняем только то, что отличается: setMyName у Telegram жёстко лимитирован,
+    а бот перезапускается каждый день. Сбой — не повод не стартовать.
+    """
+    try:
+        if (await bot.get_my_name()).name != BOT_NAME:
+            await bot.set_my_name(name=BOT_NAME)
+            logger.info("Имя бота обновлено: %s", BOT_NAME)
+        if (await bot.get_my_description()).description != BOT_DESCRIPTION:
+            await bot.set_my_description(description=BOT_DESCRIPTION)
+            logger.info("Описание бота обновлено")
+        if (await bot.get_my_short_description()).short_description != BOT_SHORT_DESCRIPTION:
+            await bot.set_my_short_description(short_description=BOT_SHORT_DESCRIPTION)
+            logger.info("Короткое описание бота обновлено")
+    except Exception:  # noqa: BLE001
+        logger.warning("Не удалось обновить профиль бота", exc_info=True)
+
+
 # Сколько плановый рестарт ждёт простоя, прежде чем перезапуститься всё равно.
 RESTART_IDLE_WAIT = 3600
 
@@ -641,6 +678,7 @@ async def main() -> None:
     # Апдейты, пришедшие, пока бот лежал (плановый рестарт, деплой), не
     # выбрасываем: иначе ссылки, присланные в эти секунды, молча терялись бы.
     await bot.delete_webhook(drop_pending_updates=False)
+    await _sync_profile(bot)
     try:
         await dp.start_polling(bot)
     finally:
