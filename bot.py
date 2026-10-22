@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import glob
 import logging
 import os
@@ -14,7 +15,9 @@ import re
 import shutil
 import signal
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from aiogram import Bot, Dispatcher, F, html
 from aiogram.client.default import DefaultBotProperties
@@ -49,14 +52,17 @@ WELCOME = (
     "• YouTube Shorts\n"
     "• Instagram Reels\n"
     "• Threads\n\n"
-    "I'll download it and send it back here — photos and carousels too.\n\n"
+    "I'll download it and send it back here — Instagram and Threads photos "
+    "and carousels too.\n\n"
     "✂️ To cut clips, add timecodes after the link:\n"
     "<code>&lt;link&gt; 1:00-1:10, 2:10-2:55</code>\n"
     "Each range comes back as a separate video, in order."
 )
 
-# Чтобы не спамить владельцу про cookies — не чаще раза в 6 часов.
-_last_cookie_notify = {"t": 0.0}
+# Чтобы не спамить владельцу про cookies — не чаще раза в 6 часов. Начинаем с
+# -inf, а не с 0: monotonic() отсчитывает от загрузки хоста, и после свежей
+# перезагрузки первое уведомление молчало бы до 6 часов аптайма.
+_last_cookie_notify = {"t": float("-inf")}
 
 
 @dp.message(CommandStart())
@@ -95,7 +101,7 @@ async def handle_cookies_upload(message: Message, config: Config) -> None:
             return
         os.chmod(config.cookies_file, 0o600)
         # yt-dlp читает cookiefile при каждом скачивании — перезагрузка не нужна.
-        await message.answer("✅ Cookies updated for: " + ", ".join(domains))
+        await message.answer("✅ Cookies updated for: " + html.quote(", ".join(domains)))
         logger.info("Cookies обновлены владельцем %s: %s",
                     message.from_user.id, ", ".join(domains))
     except Exception:  # noqa: BLE001
@@ -109,8 +115,14 @@ async def handle_cookies_upload(message: Message, config: Config) -> None:
 
 
 # Таймкод-диапазоны в сообщении: «1:00-1:10», «2:10-2:55», «1:02:03-1:02:30», «5-30».
-_RANGE_RE = re.compile(r"(\d{1,3}(?::\d{2}){0,2})\s*[-–—]\s*(\d{1,3}(?::\d{2}){0,2})")
+# Границы по краям — чтобы «2024-2025» в тексте не читалось как клип 0:24–3:22.
+_RANGE_RE = re.compile(
+    r"(?<![\d:])(\d{1,3}(?::\d{2}){0,2})\s*[-–—]\s*(\d{1,3}(?::\d{2}){0,2})(?![\d:])")
 MAX_CLIPS = 20
+# Сколько секунд клипов можно заказать одним сообщением. Куски кодируются в
+# H.264 на CPU мини-ПК, а бот открыт всем — без потолка один запрос
+# «0:00-10:00:00» занимал бы его часами.
+MAX_CUT_SECONDS = 30 * 60
 
 
 def _ts_to_sec(ts: str) -> int:
@@ -154,8 +166,8 @@ async def handle_link(message: Message, config: Config) -> None:
 
     if not downloader.is_supported(url):
         await message.answer(
-            "This link isn't supported. I can do TikTok, YouTube Shorts, "
-            "Instagram and Threads."
+            "This link isn't supported. Send a link to a single video or post "
+            "from TikTok, YouTube, Instagram or Threads."
         )
         return
 
@@ -234,47 +246,88 @@ def _sweep_stale_work_dirs(config: Config) -> None:
         logger.info("Убрано осиротевших каталогов загрузок: %d", removed)
 
 
+# Сколько запросов обрабатываем одновременно. Каждый — поток yt-dlp, а
+# перекодирование и нарезка грузят CPU мини-ПК (4 ядра); бот открыт всем,
+# поэтому остальные запросы ждут в очереди — и видят это в статусе.
+MAX_PARALLEL_JOBS = 3
+_job_slots = asyncio.Semaphore(MAX_PARALLEL_JOBS)
+# Запросы в работе, включая ждущие в очереди: плановый рестарт ждёт, пока их не станет.
+_jobs_in_flight = 0
+
+
+@contextlib.asynccontextmanager
+async def _job(status: Message, working_text: str):
+    """Место в очереди запросов; пока ждём — статус об этом говорит."""
+    global _jobs_in_flight
+    _jobs_in_flight += 1
+    try:
+        queued = _job_slots.locked()
+        if queued:
+            await _safe_edit(status, "⏳ Waiting in line — other downloads are running…")
+        async with _job_slots:
+            if queued:
+                await _safe_edit(status, working_text)
+            yield
+    finally:
+        _jobs_in_flight -= 1
+
+
+def _who(message: Message) -> str:
+    return str(message.from_user.id) if message.from_user else "?"
+
+
+async def _report_download_error(
+    message: Message, status: Message, config: Config, url: str,
+    e: downloader.DownloadError,
+) -> None:
+    """Ошибку скачивания — в лог и пользователю (текст экранируем: HTML-режим)."""
+    logger.info("Не скачалось для %s: %s — %s", _who(message), url, e)
+    await status.edit_text(f"❌ {html.quote(str(e))}")
+    if e.auth and _needs_cookies(url):
+        await _notify_owner_cookies(message.bot, config)
+
+
 async def _handle_full(message: Message, config: Config, url: str) -> None:
     status = await message.answer("⏳ Downloading…")
 
-    os.makedirs(config.download_dir, exist_ok=True)
-    work_dir = tempfile.mkdtemp(prefix="vdl_", dir=config.download_dir)
-    try:
+    async with _job(status, "⏳ Downloading…"):
+        os.makedirs(config.download_dir, exist_ok=True)
+        work_dir = tempfile.mkdtemp(prefix="vdl_", dir=config.download_dir)
         try:
-            result = await downloader.download(
-                url, config, work_dir, _make_progress_hook(status))
-        except downloader.DownloadError as e:
-            await status.edit_text(f"❌ {e}")
-            if e.auth and _needs_cookies(url):
-                await _notify_owner_cookies(message.bot, config)
-            return
-        except Exception:  # noqa: BLE001
-            logger.exception("Неожиданная ошибка при скачивании %s", url)
-            await status.edit_text(
-                "❌ Something went wrong while handling this link."
-            )
-            return
+            try:
+                result = await downloader.download(
+                    url, config, work_dir, _make_progress_hook(status))
+            except downloader.DownloadError as e:
+                await _report_download_error(message, status, config, url, e)
+                return
+            except Exception:  # noqa: BLE001
+                logger.exception("Неожиданная ошибка при скачивании %s", url)
+                await status.edit_text(
+                    "❌ Something went wrong while handling this link."
+                )
+                return
+            logger.info("Скачано для %s: %s — %d файл(ов), %.1f МБ", _who(message), url,
+                        len(result.items), result.total_size / 1024 / 1024)
 
-        # Скачалось только без cookies — сессия негодна: владельцу стоит знать,
-        # иначе закрытые посты будут молча недоступны (см. _extract_info).
-        if result.cookies_stale:
-            await _notify_owner_cookies(message.bot, config, stale_session=True)
+            # Скачалось только без cookies — сессия негодна: владельцу стоит знать,
+            # иначе закрытые посты будут молча недоступны (см. _extract_info).
+            if result.cookies_stale:
+                await _notify_owner_cookies(message.bot, config, stale_session=True)
 
-        # «Отправляю…» показываем только для крупных файлов (мелкие уходят мгновенно).
-        # Эмодзи тот же, чтобы не было «прыжка» глифа.
-        if result.total_size > 25 * 1024 * 1024:
-            await _safe_edit(status, "⏳ Uploading…")
-        try:
-            await _send_media(message, result, url)
-            await status.delete()
-        except Exception:  # noqa: BLE001
-            logger.exception("Не удалось отправить медиа")
-            await status.edit_text(
-                "❌ Downloaded it, but Telegram rejected the file — "
-                "it's probably too large."
-            )
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+            # «Отправляю…» показываем только для крупных файлов (мелкие уходят мгновенно).
+            # Эмодзи тот же, чтобы не было «прыжка» глифа.
+            if result.total_size > 25 * 1024 * 1024:
+                await _safe_edit(status, "⏳ Uploading…")
+            try:
+                await _send_media(message, result, url)
+                await status.delete()
+            except Exception:  # noqa: BLE001
+                logger.exception("Не удалось отправить медиа")
+                await status.edit_text(
+                    "❌ Downloaded it, but Telegram didn't accept the file."
+                )
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 async def _handle_cut(
@@ -286,59 +339,71 @@ async def _handle_cut(
         await message.answer(
             "⚠️ Skipped these — the start isn't before the end: " + ", ".join(rejected)
         )
-    status = await message.answer(f"⏳ Downloading… (then cutting {len(ranges)} clip(s))")
+    total = sum(end - start for start, end in ranges)
+    if total > MAX_CUT_SECONDS:
+        await message.answer(
+            f"⚠️ That's {_fmt_ts(total)} of clips in total — I cut up to "
+            f"{_fmt_ts(MAX_CUT_SECONDS)} per message."
+        )
+        return
+    working_text = f"✂️ Cutting {len(ranges)} clip(s)…"
+    status = await message.answer(working_text)
 
-    os.makedirs(config.download_dir, exist_ok=True)
-    work_dir = tempfile.mkdtemp(prefix="cut_", dir=config.download_dir)
-    try:
+    async with _job(status, working_text):
+        os.makedirs(config.download_dir, exist_ok=True)
+        work_dir = tempfile.mkdtemp(prefix="cut_", dir=config.download_dir)
         try:
-            src, vdur = await downloader.download_full(
-                url, config, work_dir, _make_progress_hook(status))
-        except downloader.DownloadError as e:
-            await status.edit_text(f"❌ {e}")
-            if e.auth and _needs_cookies(url):
-                await _notify_owner_cookies(message.bot, config)
-            return
-        except Exception:  # noqa: BLE001
-            logger.exception("cut: не удалось скачать %s", url)
-            await status.edit_text(
-                "❌ Something went wrong while handling this link."
-            )
-            return
-
-        await _safe_edit(status, f"✂️ Cutting {len(ranges)} clip(s)…")
-        sent = 0
-        for start, end in ranges:  # по порядку → и приходят по порядку
-            label = f"{_fmt_ts(start)}–{_fmt_ts(end)}"
-            if vdur and start >= vdur:
-                await message.answer(
-                    f"⏭ {label}: skipped, the video is only {_fmt_ts(vdur)} long"
-                )
-                continue
-            clip_end = min(end, vdur) if vdur else end
             try:
-                clip = await downloader.cut_segment(src, work_dir, start, clip_end, config)
-                await message.answer_video(
-                    video=FSInputFile(clip.path, filename="clip.mp4"),
-                    caption=label,
-                    duration=clip.duration,
-                    width=clip.width,
-                    height=clip.height,
-                    supports_streaming=True,
-                )
-                sent += 1
+                result = await downloader.download_clips(
+                    url, config, work_dir, ranges, _make_progress_hook(status, working_text))
             except downloader.DownloadError as e:
-                await message.answer(f"❌ {label}: {e}")
+                await _report_download_error(message, status, config, url, e)
+                return
             except Exception:  # noqa: BLE001
-                logger.exception("cut: сегмент %s не удался", label)
-                await message.answer(f"❌ {label}: couldn't process this piece")
+                logger.exception("cut: не удалось скачать %s", url)
+                await status.edit_text(
+                    "❌ Something went wrong while handling this link."
+                )
+                return
+            logger.info("Нарезано для %s: %s — %d из %d клип(ов)", _who(message), url,
+                        len(result.clips), len(ranges))
+            if result.cookies_stale:
+                await _notify_owner_cookies(message.bot, config, stale_session=True)
 
-        if sent:
-            await status.delete()
-        else:
-            await _safe_edit(status, "❌ Couldn't produce any clips.")
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+            vdur = result.duration
+            sent = 0
+            for i, (start, end) in enumerate(ranges):  # по порядку → и приходят по порядку
+                label = f"{_fmt_ts(start)}–{_fmt_ts(end)}"
+                if vdur and start >= vdur:
+                    await message.answer(
+                        f"⏭ {label}: skipped, the video is only {_fmt_ts(vdur)} long"
+                    )
+                    continue
+                clip = result.clips.get(i)
+                if clip is None:
+                    error = result.errors.get(i, "couldn't process this piece")
+                    await message.answer(f"❌ {label}: {html.quote(error)}")
+                    continue
+                try:
+                    await message.answer_video(
+                        video=FSInputFile(clip.path, filename="clip.mp4"),
+                        caption=label,
+                        duration=clip.duration,
+                        width=clip.width,
+                        height=clip.height,
+                        supports_streaming=True,
+                    )
+                    sent += 1
+                except Exception:  # noqa: BLE001
+                    logger.exception("cut: не удалось отправить клип %s", label)
+                    await message.answer(f"❌ {label}: Telegram didn't accept this clip")
+
+            if sent:
+                await status.delete()
+            else:
+                await _safe_edit(status, "❌ Couldn't produce any clips.")
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _chunks(items: list, n: int):
@@ -424,7 +489,7 @@ async def _safe_edit(status: Message, text: str) -> None:
 
 def _needs_cookies(url: str) -> bool:
     """Площадки, где логин-ошибка означает протухшие cookies, а не битую ссылку."""
-    return bool(re.search(r"instagram\.|instagr\.am|threads\.", url, re.IGNORECASE))
+    return downloader.site_of(url) in ("instagram", "threads")
 
 
 async def _notify_owner_cookies(
@@ -463,30 +528,75 @@ async def _notify_owner_cookies(
         logger.exception("Не удалось уведомить владельца про cookies")
 
 
+# Отметка «event loop жив»: heartbeat ставит её на каждом ходе, watchdog-поток
+# проверяет, не застыла ли она.
+_loop_tick = {"t": time.monotonic()}
+# Столько секунд без отметки = loop завис (ход heartbeat — раз в 30 с).
+LOOP_STALL_LIMIT = 180
+# Свой поток для пушей в health-monitor: общий пул asyncio занят скачиваниями
+# (to_thread), и при загруженном пуле heartbeat ждал бы там своей очереди.
+_beat_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="heartbeat")
+
+
 async def _heartbeat() -> None:
-    """Трогает файл-маячок — по нему Docker HEALTHCHECK видит живость polling'а."""
-    loop = asyncio.get_event_loop()
+    """Раз в 30 с: отметка для watchdog, файл-маячок для HEALTHCHECK, пуш в монитор.
+
+    Всё идёт с event loop: если он завис, маячок стареет, пуши прекращаются,
+    а watchdog перезапускает процесс (см. _start_watchdog).
+    """
+    loop = asyncio.get_running_loop()
     while True:
+        _loop_tick["t"] = time.monotonic()
         try:
             with open(HEARTBEAT_FILE, "w") as f:
                 f.write(str(int(time.time())))
         except OSError:
             pass
-        # also report to the services health monitor (offloaded so a slow/down
-        # monitor never stalls polling)
-        await loop.run_in_executor(None, lambda: beat("polling alive", service_id="videodl-bot"))
+        # Ответа не ждём: медленный или лежащий монитор не должен тормозить этот
+        # цикл. beat() сам глотает свои ошибки.
+        loop.run_in_executor(_beat_pool, lambda: beat("polling alive", service_id="videodl-bot"))
         await asyncio.sleep(30)
 
 
+def _start_watchdog() -> None:
+    """Поток, который перезапускает процесс, если event loop завис.
+
+    Docker сам unhealthy-контейнер не рестартит: restart-политика срабатывает
+    только на выход процесса. Поэтому выходим сами — `restart: unless-stopped`
+    поднимет бота заново.
+    """
+    def watch() -> None:
+        while True:
+            time.sleep(30)
+            stalled = time.monotonic() - _loop_tick["t"]
+            if stalled > LOOP_STALL_LIMIT:
+                logger.critical("Event loop не отвечает %.0f с — перезапускаю процесс", stalled)
+                os._exit(1)
+
+    threading.Thread(target=watch, name="watchdog", daemon=True).start()
+
+
+# Сколько плановый рестарт ждёт простоя, прежде чем перезапуститься всё равно.
+RESTART_IDLE_WAIT = 3600
+
+
 async def _scheduled_restart(hours: int) -> None:
-    """Раз в `hours` часов мягко гасим процесс через SIGTERM.
+    """Раз в `hours` часов мягко гасим процесс через SIGTERM — дождавшись простоя.
 
     Docker с `restart: unless-stopped` поднимет контейнер заново, а entrypoint
     при старте обновит yt-dlp. Так библиотека всегда свежая без пересборки образа.
+    Рестарт посреди скачивания оставил бы пользователя с вечным «Downloading…»,
+    поэтому ждём, пока запросов в работе не станет (но не дольше RESTART_IDLE_WAIT).
     """
     if hours <= 0:
         return
     await asyncio.sleep(hours * 3600)
+    deadline = time.monotonic() + RESTART_IDLE_WAIT
+    while _jobs_in_flight and time.monotonic() < deadline:
+        await asyncio.sleep(10)
+    if _jobs_in_flight:
+        logger.warning("Плановый рестарт: простоя не дождался, прерываю запросов: %d",
+                       _jobs_in_flight)
     logger.info("Плановый рестарт (%d ч) для обновления yt-dlp — шлю SIGTERM.", hours)
     os.kill(os.getpid(), signal.SIGTERM)
 
@@ -513,12 +623,15 @@ async def main() -> None:
     _sweep_stale_work_dirs(config)
 
     logger.info("Бот запущен. Каталог загрузок: %s | owner: %s", config.download_dir, config.owner_id)
-    await bot.delete_webhook(drop_pending_updates=True)
 
     bg = [
         asyncio.create_task(_heartbeat()),
         asyncio.create_task(_scheduled_restart(config.auto_update_hours)),
     ]
+    _start_watchdog()
+    # Апдейты, пришедшие, пока бот лежал (плановый рестарт, деплой), не
+    # выбрасываем: иначе ссылки, присланные в эти секунды, молча терялись бы.
+    await bot.delete_webhook(drop_pending_updates=False)
     try:
         await dp.start_polling(bot)
     finally:

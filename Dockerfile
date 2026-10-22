@@ -44,6 +44,12 @@ RUN apt-get update \
 
 COPY --from=ffmpeg /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /usr/local/bin/
 
+# JS-рантайм для YouTube: с конца 2025 yt-dlp решает его JS-проверки через
+# внешний рантайм (yt-dlp-ejs ставится с yt-dlp[default]). Без него YouTube
+# «deprecated, some formats may be missing» и может отвалиться совсем. deno —
+# рантайм, который yt-dlp включает по умолчанию; образ bin-* — один бинарь.
+COPY --from=denoland/deno:bin-2.9.7 /deno /usr/local/bin/deno
+
 # uid/gid 101 — СПЕЦИАЛЬНО совпадает с telegram-bot-api (он работает под uid 101),
 # чтобы общий каталог на HDD читался/писался обоими контейнерами без правок прав.
 RUN groupadd --system --gid 101 app \
@@ -64,7 +70,10 @@ RUN chmod +x docker/entrypoint.sh
 
 USER app
 
-# Маячок живости: бот трогает /tmp/heartbeat раз в 30с; если завис — Docker рестартит.
+# Маячок живости: бот трогает /tmp/heartbeat раз в 30с. HEALTHCHECK только
+# помечает контейнер unhealthy (для мониторинга) — сам Docker его не рестартит.
+# Зависший event loop перезапускает watchdog внутри бота (выход процесса →
+# restart: unless-stopped).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import os,time,sys; sys.exit(0 if os.path.exists('/tmp/heartbeat') and time.time()-os.path.getmtime('/tmp/heartbeat')<120 else 1)"
 
