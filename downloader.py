@@ -72,12 +72,16 @@ class DownloadError(Exception):
     no_post=True — страницу поста вообще не отдали (редирект на главную,
     заготовка без данных, 404). Признак негодной сессии → есть смысл
     переспросить анонимно, см. _extract_info.
+    no_media=True — пост отдали, но медиа в нём не нашлось. Под сессией это
+    может быть урезанный ответ API → тоже переспрашиваем анонимно.
     """
 
-    def __init__(self, message: str, auth: bool = False, no_post: bool = False) -> None:
+    def __init__(self, message: str, auth: bool = False, no_post: bool = False,
+                 no_media: bool = False) -> None:
         super().__init__(message)
         self.auth = auth
         self.no_post = no_post
+        self.no_media = no_media
 
 
 def extract_url(text: str) -> str | None:
@@ -172,6 +176,9 @@ _NO_POST_MARKERS = (
     "hidden from logged-out", "could not find post data", "http error 404",
 )
 
+# «Пост есть, медиа нет» — текст плагина Threads. Отсюда флаг no_media.
+_NO_MEDIA_MARKERS = ("has no photo or video",)
+
 # (маркеры в тексте yt-dlp) → что показать. Первое совпадение выигрывает,
 # поэтому конкретные случаи идут раньше общих.
 _ERROR_MESSAGES = (
@@ -213,6 +220,7 @@ def _as_download_error(e: Exception) -> DownloadError:
     # Признак «страницы поста не было» считаем по тексту yt-dlp, а не по нашему
     # переводу: перевод человеческий и нужных слов в нём может не остаться.
     no_post = any(marker in low for marker in _NO_POST_MARKERS)
+    no_media = any(marker in low for marker in _NO_MEDIA_MARKERS)
 
     if any(marker in low for marker in _AUTH_MARKERS):
         return DownloadError(
@@ -222,7 +230,7 @@ def _as_download_error(e: Exception) -> DownloadError:
         )
     for markers, text in _ERROR_MESSAGES:
         if any(marker in low for marker in markers):
-            return DownloadError(text, no_post=no_post)
+            return DownloadError(text, no_post=no_post, no_media=no_media)
 
     # Неизвестный случай — отдаём текст yt-dlp, но без служебного префикса и
     # без простыни на пол-экрана.
@@ -301,16 +309,23 @@ def _extract_info(opts: dict, url: str) -> dict:
         # качается). Поэтому если с cookies не вышло — пробуем ещё раз без них,
         # иначе протухшая запись ломала бы Threads целиком.
         #
-        # Но только на no_post (страницу поста не отдали) — это и есть симптом
-        # негодной сессии. Если пост распарсился и в нём просто нет медиа,
-        # повторять анонимно нечего: тот же ответ за вдвое больше запросов.
-        if (e.auth or not e.no_post
+        # Повод — no_post (страницу поста не отдали): это и есть симптом
+        # негодной сессии. И no_media: под сессией плагин берёт пост из
+        # приватного API, а там цитата может прийти без медиа процитированного
+        # поста, хотя гостевой HTML его отдаёт (так было с
+        # @margarita_oliverivna/post/Dev_Rq2Dva9: бот ответил «text only»,
+        # анонимно — видео из цитаты).
+        if (e.auth or not (e.no_post or e.no_media)
                 or not (is_threads(url) and opts.get("cookiefile"))):
             raise
         logger.info("Threads: не вышло с cookies (%s) — пробую анонимно", e)
         try:
             info = _extract_info_attempts({**opts, "cookiefile": None}, url)
         except DownloadError as anon:
+            # Сессия пост отдала, и он правда без медиа — её ответ и показываем:
+            # что гостю пост не виден, ничего к нему не добавляет.
+            if e.no_media:
+                raise e from anon
             if not anon.no_post:
                 raise
             # Ни с сессией, ни без неё страницы поста нет. Пост может быть правда
@@ -322,6 +337,9 @@ def _extract_info(opts: dict, url: str) -> dict:
                 "audience than the saved session belongs to.",
                 auth=True, no_post=True,
             ) from anon
+        if e.no_media:
+            # Сессия рабочая — пост она отдала, просто без медиа. Не протухла.
+            return info
         # Анонимно получилось, а с cookies — нет. С рабочей сессией так не
         # бывает: значит запись для threads.com протухла и режет доступ.
         logger.warning("Threads: cookies протухли — без них пост открылся, с ними нет")
