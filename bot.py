@@ -52,8 +52,8 @@ WELCOME = (
     "• YouTube Shorts\n"
     "• Instagram Reels\n"
     "• Threads\n\n"
-    "I'll download it and send it back here — Instagram and Threads photos "
-    "and carousels too.\n\n"
+    "I'll download it and send it back here — photos, carousels and TikTok "
+    "slideshows too.\n\n"
     "✂️ To cut clips, add timecodes after the link:\n"
     "<code>&lt;link&gt; 1:00-1:10, 2:10-2:55</code>\n"
     "Each range comes back as a separate video, in order."
@@ -435,19 +435,15 @@ def _caption_for(result: downloader.DownloadResult) -> str | None:
 
 
 async def _send_media(message: Message, result: downloader.DownloadResult, url: str) -> None:
-    items = result.items
     # Текст поста добавляем только для Threads — у остальных источников
     # description обычно мусорный (хэштеги, авто-заголовки).
     caption = _caption_for(result) if downloader.is_threads(url) else None
-
-    if len(items) == 1:
-        await _send_single(message, items[0], caption)
-        return
+    visual = [it for it in result.items if not it.is_audio]
 
     # Слайдшоу / карусель — отправляем альбомами по 10 (лимит Telegram).
     # Caption вешаем только на первый элемент первого альбома — Telegram
     # показывает его под всем альбомом.
-    for chunk in _chunks(items, 10):
+    for chunk in _chunks(visual, 10):
         if len(chunk) == 1:
             await _send_single(message, chunk[0], caption)
             caption = None
@@ -462,6 +458,19 @@ async def _send_media(message: Message, result: downloader.DownloadResult, url: 
             )
             caption = None
         await message.answer_media_group(media=media)
+
+    # Музыка слайдшоу TikTok. В альбом к фото звук не положить (Telegram
+    # группирует аудио только с аудио) — шлём следом отдельным треком.
+    for it in result.items:
+        if it.is_audio:
+            await message.answer_audio(
+                audio=FSInputFile(it.path, filename="music" + os.path.splitext(it.path)[1]),
+                caption=caption,
+                title=it.title,
+                performer=it.performer,
+                duration=it.duration,
+            )
+            caption = None
 
 
 async def _send_single(

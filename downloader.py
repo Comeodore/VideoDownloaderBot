@@ -1,7 +1,9 @@
 """Обёртка над yt-dlp: скачивание видео/фото из TikTok / Instagram / YouTube Shorts / Threads.
 
-Поддерживает одиночные видео, а у Instagram и Threads — ещё фото и карусели
-(несколько медиа в посте). Фото-посты TikTok yt-dlp не умеет.
+Поддерживает одиночные видео, фото и карусели/слайдшоу (несколько медиа в
+посте), у слайдшоу TikTok — и фоновую музыку. Фото Instagram, сторис, Threads и
+фото-посты TikTok — свои плагины в yt_dlp_plugins: сам yt-dlp у этих площадок
+берёт только видео.
 """
 from __future__ import annotations
 
@@ -18,7 +20,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import yt_dlp
 
@@ -60,10 +62,17 @@ _SITES = {
 # ссылка на профиль выкачивала бы чужой аккаунт целиком.
 _ALLOWED_EXTRACTORS = [
     r"tiktok", r"vm\.tiktok",                # ролик и короткие vm./t/ ссылки
-    r"instagram", r"instagram:story",        # пост/рилс и сторис
+    r"tiktok:photo",                         # наш плагин: фото-посты
+    # Пост/рилс и сторис. «+videobot» — наши надстройки (фото, сторис по
+    # номеру): yt-dlp подменяет ими свои экстракторы, и суффикс в имени есть.
+    r"instagram(?:\+videobot)?", r"instagram:story(?:\+videobot)?",
     r"youtube", r"youtube:tab",              # tab — ролик, открытый из плейлиста
     r"threads",                              # наш плагин
 ]
+
+# Сколько медиа поста берём: фото-пост TikTok — до 35 картинок и музыка,
+# карусель Instagram — до 20. Бот шлёт их альбомами по 10 (лимит media group).
+MAX_POST_ITEMS = 36
 
 _URL_RE = re.compile(r"https?://\S+")
 # Знаки, которые на конце ссылки в тексте почти всегда пунктуация, а не её часть.
@@ -71,7 +80,11 @@ _URL_TAIL = ".,;:!?…»\"'>]"
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov"}
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
-_SKIP_EXTS = {".part", ".ytdl", ".temp", ".m4a", ".f4v"}
+# Отдельным треком приходит музыка слайдшоу TikTok (MP3 или M4A).
+AUDIO_EXTS = {".mp3", ".m4a"}
+_SKIP_EXTS = {".part", ".ytdl", ".temp", ".f4v"}
+# Промежуточные дорожки yt-dlp до склейки видео со звуком: «001-id.f140.m4a».
+_INTERMEDIATE_RE = re.compile(r"\.f[^.]+\.[^.]+$")
 
 
 @dataclass
@@ -81,6 +94,10 @@ class MediaItem:
     width: int | None = None
     height: int | None = None
     duration: int | None = None
+    # Аудио (музыка слайдшоу): бот шлёт его отдельным треком с этими подписями.
+    is_audio: bool = False
+    title: str | None = None
+    performer: str | None = None
 
 
 @dataclass
@@ -162,6 +179,24 @@ def site_of(url: str) -> str | None:
 
 def is_supported(url: str) -> bool:
     return site_of(url) is not None
+
+
+def _normalize_url(url: str) -> str:
+    """Ссылка TikTok в форме, которую узнаёт экстрактор yt-dlp; прочие — как есть.
+
+    Экстрактор TikTok требует хост www.tiktok.com: ссылки без www
+    (tiktok.com/@u/video/1) и старые мобильные m.tiktok.com/v/<id>.html он не
+    узнаёт («Unsupported URL»). Короткие vm./vt. не трогаем — у них свой экстрактор.
+    """
+    if site_of(url) != "tiktok":
+        return url
+    parts = urlsplit(url)
+    if parts.hostname in ("www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com"):
+        return url
+    path = parts.path
+    if old_mobile := re.fullmatch(r"/v/(\d+)\.html", path):
+        path = f"/share/video/{old_mobile.group(1)}"
+    return urlunsplit(("https", "www.tiktok.com", path, parts.query, ""))
 
 
 def is_threads(url: str) -> bool:
@@ -298,10 +333,6 @@ _ERROR_MESSAGES = (
      "or visible only to logged-in users."),
     (("has no photo or video",),
      "This post is text only — no photo or video in it."),
-    # Фото-посты TikTok yt-dlp не умеет: его экстрактор берёт только /video/.
-    # /photo/ в пути из наших площадок бывает только у TikTok.
-    (("/photo/",),
-     "TikTok photo posts aren't supported — only TikTok videos."),
     (("unsupported url", "no suitable extractor"),
      "This link doesn't point to a video or a post."),
     (("blocked from accessing", "ip address is blocked"),
@@ -557,9 +588,9 @@ def _build_opts(config: Config, out_template: str, url: str, work_dir: str) -> d
         "retries": 3,
         "concurrent_fragment_downloads": 4,
         "max_filesize": config.max_file_size_bytes,
-        # Страховка: любой «плейлист» — не больше 10 элементов (лимит media group
-        # в Telegram), даже если площадка неожиданно отдаст список.
-        "playlistend": 10,
+        # Медиа одного поста, а заодно страховка: любой «плейлист» — не больше
+        # MAX_POST_ITEMS, даже если площадка неожиданно отдаст список.
+        "playlistend": MAX_POST_ITEMS,
     }
     # Карусели Instagram/Threads — это «плейлист» из нескольких медиа.
     if site_of(url) in ("instagram", "threads"):
@@ -577,9 +608,9 @@ def _collect_media(work_dir: str) -> list[str]:
         if not os.path.isfile(path):
             continue
         ext = os.path.splitext(path)[1].lower()
-        if ext in _SKIP_EXTS:
+        if ext in _SKIP_EXTS or _INTERMEDIATE_RE.search(os.path.basename(path)):
             continue
-        if ext in VIDEO_EXTS or ext in PHOTO_EXTS:
+        if ext in VIDEO_EXTS or ext in PHOTO_EXTS or ext in AUDIO_EXTS:
             files.append(path)
     return files
 
@@ -655,7 +686,7 @@ def _download_blocking(
     work_dir: str,
     progress_hook: Callable[[dict], None] | None = None,
 ) -> DownloadResult:
-    url = _resolve_share_link(url)
+    url = _resolve_share_link(_normalize_url(url))
     # autonumber сохраняет порядок элементов карусели
     out_template = os.path.join(work_dir, "%(autonumber)03d-%(id)s.%(ext)s")
     opts = _build_opts(config, out_template, url, work_dir)
@@ -671,10 +702,18 @@ def _download_blocking(
             f"{config.max_file_size_mb} MB limit."
         )
 
+    # Метаданные элементов по id — для подписей трека (имя файла: NNN-<id>.<ext>).
+    entries = {e["id"]: e for e in info.get("entries") or [info] if e and e.get("id")}
     items = []
     for f in files:
-        is_video = os.path.splitext(f)[1].lower() in VIDEO_EXTS
-        item = MediaItem(path=f, is_video=is_video)
+        ext = os.path.splitext(f)[1].lower()
+        is_video = ext in VIDEO_EXTS
+        item = MediaItem(path=f, is_video=is_video, is_audio=ext in AUDIO_EXTS)
+        if item.is_audio:
+            entry = entries.get(os.path.splitext(os.path.basename(f))[0].split("-", 1)[-1]) or {}
+            item.title = entry.get("track") or entry.get("title")
+            item.performer = entry.get("artist")
+            item.duration = _to_int(entry.get("duration"))
         if is_video:
             # Гарантируем H.264 (перекодируем VP9/HEVC/AV1), берём размеры из файла.
             item.path = _ensure_telegram_playable(f)
@@ -768,7 +807,7 @@ def _download_clips_blocking(
     кадру, клип готов для Telegram. Раньше видео качалось целиком и без лимита
     размера — «0:00-0:05» по многочасовому стриму стоило гигабайты.
     """
-    url = _resolve_share_link(url)
+    url = _resolve_share_link(_normalize_url(url))
     out_template = os.path.join(work_dir, "clip-%(section_number)03d.%(ext)s")
     opts = _build_opts(config, out_template, url, work_dir)
     opts.pop("max_filesize", None)  # размер куска заранее не известен — проверяем после

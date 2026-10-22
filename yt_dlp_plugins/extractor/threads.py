@@ -24,6 +24,8 @@ from yt_dlp.utils import (
     traverse_obj,
 )
 
+from yt_dlp_plugins.extractor._images import best_image
+
 _BASE_URL = 'https://www.threads.com/'
 # X-IG-App-ID веб-клиента Threads: без него приватный API отвечает 302 на логин.
 # Значение лежит в любой странице threads.com (RelayAPIConfigDefaults.customHeaders).
@@ -39,7 +41,9 @@ _SHARED_POST_KEYS = ('quoted_attachment_post', 'quoted_post', 'reposted_post')
 
 
 class ThreadsIE(InfoExtractor):
-    _VALID_URL = r'https?://(?:www\.)?threads\.(?:com|net)/(?P<uploader>[^/?#]+)/post/(?P<id>[^/?#&]+)'
+    # /@user/post/<code> — обычная ссылка; /t/<code> — старая короткая, Threads
+    # редиректит её (301) на обычную. Код поста в обеих один и тот же.
+    _VALID_URL = r'https?://(?:www\.)?threads\.(?:com|net)/(?:(?P<uploader>[^/?#]+)/post|t)/(?P<id>[^/?#&]+)'
 
     _TESTS = [{
         'url': 'https://www.threads.com/@tntsportsbr/post/C6cqebdCfBi',
@@ -79,7 +83,7 @@ class ThreadsIE(InfoExtractor):
         # кандидаты картинки разных размеров.
         if not images:
             return None  # текстовый пост (media_type 19) — качать нечего
-        best = self._best_image(media, images)
+        best = best_image(media, images)
         return {
             'id': str(media.get('pk') or post_code),
             'formats': [{
@@ -90,29 +94,6 @@ class ThreadsIE(InfoExtractor):
                 'height': best.get('height'),
             }],
         }
-
-    @staticmethod
-    def _best_image(media, images):
-        """Крупнейший кандидат В ОРИГИНАЛЬНОМ соотношении сторон.
-
-        Кандидаты идут парами: оригинал и квадратный кроп того же размера
-        (972x1296 и 972x972). Сортировка yt-dlp по res их не различает и берёт
-        кроп, обрезая картинку, — поэтому фильтруем по original_width/height
-        сами и отдаём один формат, а не весь список.
-        """
-        def area(t):
-            return (t.get('width') or 0) * (t.get('height') or 0)
-
-        width, height = media.get('original_width'), media.get('original_height')
-        if width and height:
-            ratio = width / height
-            original = [
-                t for t in images if t.get('width') and t.get('height')
-                and abs(t['width'] / t['height'] - ratio) < 0.01
-            ]
-            if original:
-                return max(original, key=area)
-        return max(images, key=area)
 
     def _entries(self, post, post_code):
         """Медиа поста: карусель — по элементам, одиночный — сам объект."""
