@@ -50,7 +50,7 @@ WELCOME = (
     "👋 Hi! Send me a link and I'll send back the video or photos:\n\n"
     "• TikTok — videos without watermark, photo slideshows + their music\n"
     "• Instagram — Reels, posts, carousels, stories\n"
-    "• YouTube — Shorts and videos\n"
+    "• YouTube — Shorts, videos and clips\n"
     "• Threads — videos, photos, carousels\n\n"
     "✂️ To cut clips, add timecodes after the link:\n"
     "<code>&lt;link&gt; 1:00-1:10, 2:10-2:55</code>\n"
@@ -71,7 +71,7 @@ BOT_DESCRIPTION = (
     "just send a link.\n\n"
     "• TikTok — videos without watermark, photo slideshows with their music\n"
     "• Instagram — Reels, posts, carousels, stories\n"
-    "• YouTube — Shorts and videos\n"
+    "• YouTube — Shorts, videos and clips\n"
     "• Threads — videos, photos, carousels\n\n"
     "✂️ Cut clips: add timecodes after the link, e.g. 1:00-1:10, 2:10-2:55"
 )
