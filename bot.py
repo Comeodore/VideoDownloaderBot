@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import logging
 import os
 import re
@@ -48,7 +49,7 @@ WELCOME = (
     "• YouTube Shorts\n"
     "• Instagram Reels\n"
     "• Threads\n\n"
-    "I'll download it and send it back here.\n\n"
+    "I'll download it and send it back here — photos and carousels too.\n\n"
     "✂️ To cut clips, add timecodes after the link:\n"
     "<code>&lt;link&gt; 1:00-1:10, 2:10-2:55</code>\n"
     "Each range comes back as a separate video, in order."
@@ -71,23 +72,40 @@ async def handle_cookies_upload(message: Message, config: Config) -> None:
     doc = message.document
     name = (doc.file_name or "").lower()
     if not (name.endswith(".txt") or "cookie" in name):
-        await message.answer("That doesn't look like cookies.txt — send a cookies text file.")
+        await message.answer("That doesn't look like cookies.txt — send a .txt cookies file.")
         return
     if not config.cookies_file:
         await message.answer("COOKIES_FILE isn't set in .env — nowhere to save it.")
         return
     if (doc.file_size or 0) > 1_000_000:
-        await message.answer("That file is too large for cookies.")
+        await message.answer("That file is too big for a cookies.txt (limit 1 MB).")
         return
+    # Экспорт из браузера обычно по одному сайту, а файл один на все площадки —
+    # поэтому вливаем поверх (см. merge_cookies_file), а не перезаписываем.
+    upload = config.cookies_file + ".upload"
     try:
-        await message.bot.download(doc, destination=config.cookies_file)
+        await message.bot.download(doc, destination=upload)
+        os.chmod(upload, 0o600)
+        domains = downloader.merge_cookies_file(upload, config.cookies_file)
+        if not domains:
+            await message.answer(
+                "No cookie lines found in that file — nothing changed. "
+                "Export in <b>Netscape</b> (cookies.txt) format, not JSON."
+            )
+            return
         os.chmod(config.cookies_file, 0o600)
         # yt-dlp читает cookiefile при каждом скачивании — перезагрузка не нужна.
-        await message.answer("✅ Cookies updated — Instagram should work again.")
-        logger.info("Cookies обновлены владельцем %s", message.from_user.id)
+        await message.answer("✅ Cookies updated for: " + ", ".join(domains))
+        logger.info("Cookies обновлены владельцем %s: %s",
+                    message.from_user.id, ", ".join(domains))
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось сохранить cookies")
-        await message.answer("❌ Couldn't save the cookies.")
+        await message.answer("❌ Couldn't save the cookies — check the bot logs.")
+    finally:
+        try:
+            os.remove(upload)
+        except OSError:
+            pass
 
 
 # Таймкод-диапазоны в сообщении: «1:00-1:10», «2:10-2:55», «1:02:03-1:02:30», «5-30».
@@ -155,6 +173,67 @@ async def handle_link(message: Message, config: Config) -> None:
         await _handle_full(message, config, url)
 
 
+# Как часто правим сообщение с прогрессом. Telegram душит частые edit'ы
+# (~20/мин на чат), поэтому раз в 5 с — 12 правок в минуту, с запасом.
+_PROGRESS_INTERVAL = 5.0
+
+
+def _make_progress_hook(status: Message, prefix: str = "⏳ Downloading…"):
+    """Хук yt-dlp → правки статусного сообщения (для 2-гигабайтных файлов).
+
+    Хук зовётся из рабочего потока (asyncio.to_thread), поэтому корутину правки
+    отправляем в основной loop через run_coroutine_threadsafe. Первую правку
+    делаем только через интервал — мелкие файлы уходят без лишнего мигания.
+    """
+    loop = asyncio.get_running_loop()
+    state = {"t": time.monotonic()}
+
+    def hook(d: dict) -> None:
+        if d.get("status") != "downloading":
+            return
+        now = time.monotonic()
+        if now - state["t"] < _PROGRESS_INTERVAL:
+            return
+        state["t"] = now
+        done = d.get("downloaded_bytes") or 0
+        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+        if total:
+            text = f"{prefix} {done * 100 // total}% of {total / 1024 / 1024:.0f} MB"
+        else:
+            text = f"{prefix} {done / 1024 / 1024:.0f} MB"
+        try:
+            asyncio.run_coroutine_threadsafe(_safe_edit(status, text), loop)
+        except RuntimeError:
+            pass  # loop уже закрыт (бот гасится) — прогресс не важен
+
+    return hook
+
+
+# Осиротевшие каталоги запросов: если процесс убили посреди скачивания
+# (плановый рестарт, OOM), rmtree в finally не выполнился и каталог остаётся
+# на диске навсегда. Подметаем на старте — там же лежат гигабайтные файлы.
+STALE_WORK_DIR_AGE = 6 * 3600
+
+
+def _sweep_stale_work_dirs(config: Config) -> None:
+    now = time.time()
+    removed = 0
+    for prefix in ("vdl_", "cut_"):
+        for path in glob.glob(os.path.join(config.download_dir, prefix + "*")):
+            if not os.path.isdir(path):
+                continue
+            try:
+                # Свежие не трогаем: вдруг рядом работает второй экземпляр.
+                if now - os.path.getmtime(path) < STALE_WORK_DIR_AGE:
+                    continue
+            except OSError:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    if removed:
+        logger.info("Убрано осиротевших каталогов загрузок: %d", removed)
+
+
 async def _handle_full(message: Message, config: Config, url: str) -> None:
     status = await message.answer("⏳ Downloading…")
 
@@ -162,16 +241,24 @@ async def _handle_full(message: Message, config: Config, url: str) -> None:
     work_dir = tempfile.mkdtemp(prefix="vdl_", dir=config.download_dir)
     try:
         try:
-            result = await downloader.download(url, config, work_dir)
+            result = await downloader.download(
+                url, config, work_dir, _make_progress_hook(status))
         except downloader.DownloadError as e:
             await status.edit_text(f"❌ {e}")
-            if e.auth and "instagram" in url.lower():
+            if e.auth and _needs_cookies(url):
                 await _notify_owner_cookies(message.bot, config)
             return
         except Exception:  # noqa: BLE001
             logger.exception("Неожиданная ошибка при скачивании %s", url)
-            await status.edit_text("❌ Something went wrong. Try another link.")
+            await status.edit_text(
+                "❌ Something went wrong while handling this link."
+            )
             return
+
+        # Скачалось только без cookies — сессия негодна: владельцу стоит знать,
+        # иначе закрытые посты будут молча недоступны (см. _extract_info).
+        if result.cookies_stale:
+            await _notify_owner_cookies(message.bot, config, stale_session=True)
 
         # «Отправляю…» показываем только для крупных файлов (мелкие уходят мгновенно).
         # Эмодзи тот же, чтобы не было «прыжка» глифа.
@@ -183,7 +270,8 @@ async def _handle_full(message: Message, config: Config, url: str) -> None:
         except Exception:  # noqa: BLE001
             logger.exception("Не удалось отправить медиа")
             await status.edit_text(
-                "❌ Couldn't send it to Telegram (the file may be too large)."
+                "❌ Downloaded it, but Telegram rejected the file — "
+                "it's probably too large."
             )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -195,22 +283,27 @@ async def _handle_cut(
 ) -> None:
     ranges = ranges[:MAX_CLIPS]
     if rejected:
-        await message.answer("⚠️ Skipped (start ≥ end): " + ", ".join(rejected))
+        await message.answer(
+            "⚠️ Skipped these — the start isn't before the end: " + ", ".join(rejected)
+        )
     status = await message.answer(f"⏳ Downloading… (then cutting {len(ranges)} clip(s))")
 
     os.makedirs(config.download_dir, exist_ok=True)
     work_dir = tempfile.mkdtemp(prefix="cut_", dir=config.download_dir)
     try:
         try:
-            src, vdur = await downloader.download_full(url, config, work_dir)
+            src, vdur = await downloader.download_full(
+                url, config, work_dir, _make_progress_hook(status))
         except downloader.DownloadError as e:
             await status.edit_text(f"❌ {e}")
-            if e.auth and "instagram" in url.lower():
+            if e.auth and _needs_cookies(url):
                 await _notify_owner_cookies(message.bot, config)
             return
         except Exception:  # noqa: BLE001
             logger.exception("cut: не удалось скачать %s", url)
-            await status.edit_text("❌ Something went wrong. Try another link.")
+            await status.edit_text(
+                "❌ Something went wrong while handling this link."
+            )
             return
 
         await _safe_edit(status, f"✂️ Cutting {len(ranges)} clip(s)…")
@@ -218,7 +311,9 @@ async def _handle_cut(
         for start, end in ranges:  # по порядку → и приходят по порядку
             label = f"{_fmt_ts(start)}–{_fmt_ts(end)}"
             if vdur and start >= vdur:
-                await message.answer(f"⏭ {label}: beyond video length ({_fmt_ts(vdur)})")
+                await message.answer(
+                    f"⏭ {label}: skipped, the video is only {_fmt_ts(vdur)} long"
+                )
                 continue
             clip_end = min(end, vdur) if vdur else end
             try:
@@ -236,7 +331,7 @@ async def _handle_cut(
                 await message.answer(f"❌ {label}: {e}")
             except Exception:  # noqa: BLE001
                 logger.exception("cut: сегмент %s не удался", label)
-                await message.answer(f"❌ {label}: couldn't process")
+                await message.answer(f"❌ {label}: couldn't process this piece")
 
         if sent:
             await status.delete()
@@ -327,20 +422,43 @@ async def _safe_edit(status: Message, text: str) -> None:
         pass
 
 
-async def _notify_owner_cookies(bot: Bot, config: Config) -> None:
-    """Сообщает владельцу о протухших cookies (не чаще раза в 6 часов)."""
+def _needs_cookies(url: str) -> bool:
+    """Площадки, где логин-ошибка означает протухшие cookies, а не битую ссылку."""
+    return bool(re.search(r"instagram\.|instagr\.am|threads\.", url, re.IGNORECASE))
+
+
+async def _notify_owner_cookies(
+    bot: Bot, config: Config, stale_session: bool = False,
+) -> None:
+    """Сообщает владельцу о протухших cookies (не чаще раза в 6 часов).
+
+    stale_session=True — частный случай Threads: пост скачался только после
+    того, как cookies отбросили. Значит сессия не просто «не хватило прав», а
+    активно мешает: с ней Threads не отдаёт даже публичные посты.
+    """
     if not config.owner_id:
         return
     now = time.monotonic()
     if now - _last_cookie_notify["t"] < 6 * 3600:
         return
     _last_cookie_notify["t"] = now
-    try:
-        await bot.send_message(
-            config.owner_id,
-            "⚠️ Looks like the Instagram cookies expired (login/rate-limit).\n"
-            "Send me a fresh <b>cookies.txt</b> as a document — I'll pick it up automatically.",
+    text = (
+        "⚠️ Looks like the cookies expired (login required / rate limit).\n"
+        "Export cookies.txt for the site that failed — <b>instagram.com</b> or "
+        "<b>threads.com</b> — and send it here as a document. I merge it into "
+        "the existing file, so the other sites keep working."
+    )
+    if stale_session:
+        text = (
+            "⚠️ The saved <b>threads.com</b> session is being refused: this post "
+            "only came through after I dropped the cookies. While that session "
+            "sits in cookies.txt, Threads hides posts that need a login.\n"
+            "Export cookies.txt for <b>threads.com</b> (logged in, with httpOnly "
+            "cookies) and send it here as a document — I merge it into the "
+            "existing file, so the other sites keep working."
         )
+    try:
+        await bot.send_message(config.owner_id, text)
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось уведомить владельца про cookies")
 
@@ -390,6 +508,9 @@ async def main() -> None:
     )
 
     dp["config"] = config
+
+    os.makedirs(config.download_dir, exist_ok=True)
+    _sweep_stale_work_dirs(config)
 
     logger.info("Бот запущен. Каталог загрузок: %s | owner: %s", config.download_dir, config.owner_id)
     await bot.delete_webhook(drop_pending_updates=True)

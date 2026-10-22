@@ -6,13 +6,27 @@
 # Stage 1: ffmpeg (статическая сборка)
 # ──────────────────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS ffmpeg
+ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl xz-utils ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-RUN curl -fsSL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ff.tar.xz \
-    && mkdir -p /ff \
-    && tar -xJf /tmp/ff.tar.xz -C /ff --strip-components=1 \
-    && cp /ff/ffmpeg /ff/ffprobe /usr/local/bin/
+# Раньше брали сборку johnvansickle — она заморожена на августе 2024 и собрана
+# только под amd64. BtbN пересобирает ffmpeg из master ежедневно и даёт arm64.
+# Вариант gpl — в нём libx264, которым бот перекодирует не-H.264 видео.
+# Цена: бинари BtbN по 140 МБ против 76 МБ у johnvansickle (образ 477 против
+# 348 МБ) — это статически влинкованные кодеки, strip ничего не снимает.
+RUN set -eu; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) ff_arch=linux64 ;; \
+      arm64) ff_arch=linuxarm64 ;; \
+      *) echo "неподдерживаемая архитектура: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-${ff_arch}-gpl.tar.xz" \
+        -o /tmp/ff.tar.xz; \
+    mkdir -p /ff; \
+    tar -xJf /tmp/ff.tar.xz -C /ff --strip-components=1; \
+    cp /ff/bin/ffmpeg /ff/bin/ffprobe /usr/local/bin/; \
+    ffmpeg -version | head -1
 
 # ──────────────────────────────────────────────────────────────────────────
 # Stage 2: runtime

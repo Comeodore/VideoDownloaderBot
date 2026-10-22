@@ -7,8 +7,10 @@ from __future__ import annotations
 import asyncio
 import glob
 import json
+import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -17,6 +19,8 @@ from typing import Callable
 import yt_dlp
 
 from config import Config
+
+logger = logging.getLogger("videobot.downloader")
 
 # Плеер Telegram (особенно iOS) надёжно играет только H.264 8-bit yuv420p.
 # HEVC → лагает, VP9/AV1 → застывает картинка (звук идёт). Всё не-H.264 перекодируем.
@@ -56,6 +60,8 @@ class DownloadResult:
     title: str = "video"
     description: str = ""
     total_size: int = 0
+    # True — скачалось только без cookies: сохранённая сессия негодна (см. _extract_info).
+    cookies_stale: bool = False
 
 
 class DownloadError(Exception):
@@ -63,11 +69,15 @@ class DownloadError(Exception):
 
     auth=True — проблема с доступом (login required / rate-limit / приватный),
     обычно означает протухшие cookies → повод уведомить владельца.
+    no_post=True — страницу поста вообще не отдали (редирект на главную,
+    заготовка без данных, 404). Признак негодной сессии → есть смысл
+    переспросить анонимно, см. _extract_info.
     """
 
-    def __init__(self, message: str, auth: bool = False) -> None:
+    def __init__(self, message: str, auth: bool = False, no_post: bool = False) -> None:
         super().__init__(message)
         self.auth = auth
+        self.no_post = no_post
 
 
 def extract_url(text: str) -> str | None:
@@ -139,21 +149,192 @@ def _impersonate_candidates() -> list:
         return [None]
 
 
+# ── Ошибки: с языка yt-dlp на человеческий ──────────────────────────────────
+# yt-dlp пишет для того, кто запускает его руками: «ERROR: [Instagram] C1zz:
+# Instagram sent an empty media response. Check if this post is accessible in
+# your browser without being logged-in. If it is...». Пользователю бота нужен
+# короткий понятный ответ, поэтому режем служебный префикс «ERROR: [Экстрактор]
+# <id>:» и переводим известные случаи.
+_YTDLP_PREFIX_RE = re.compile(r"^ERROR:\s*(?:\[[^\]]+\]\s*)?(?:[\w.-]+:\s+)?")
+
+# Признаки того, что нужен логин/свежие cookies (auth=True → повод сказать
+# владельцу, что пора обновить cookies.txt).
+_AUTH_MARKERS = (
+    "login", "log in", "sign in", "rate-limit", "rate limit", "private",
+    "empty media response", "requires authentication", "not a bot",
+)
+
+# Симптомы «страницу поста нам не отдали»: редирект на главную, страница-
+# заготовка без данных поста, 404 на весь домен. Так выглядит и закрытый пост,
+# и — что важнее — негодная сессия из cookies.txt (Threads на неё отвечает так
+# даже для публичных постов). Отсюда флаг no_post и откат в _extract_info.
+_NO_POST_MARKERS = (
+    "hidden from logged-out", "could not find post data", "http error 404",
+)
+
+# (маркеры в тексте yt-dlp) → что показать. Первое совпадение выигрывает,
+# поэтому конкретные случаи идут раньше общих.
+_ERROR_MESSAGES = (
+    # Свои сообщения из плагина Threads уже человеческие — не портим их общими.
+    (("quoted post holding the media",),
+     "This post quotes another one, and that post is unavailable — "
+     "deleted, or not shown to logged-out visitors."),
+    (("hidden from logged-out", "could not find post data"),
+     "The site didn't hand over this post — it's deleted, "
+     "or visible only to logged-in users."),
+    (("has no photo or video",),
+     "This post is text only — no photo or video in it."),
+    (("unsupported url",),
+     "This link doesn't point to a video or a post."),
+    (("blocked from accessing", "ip address is blocked"),
+     "The site is blocking this server's IP address."),
+    (("not available in your country", "geo restriction", "geo-restricted"),
+     "This video isn't available in the country where the bot runs."),
+    (("is unavailable", "has been removed", "no longer available",
+      "video not found", "does not exist"),
+     "This video is no longer available — deleted or private."),
+    (("requested format", "no video formats", "no formats found"),
+     "No downloadable video or photo in this post."),
+    (("http error 4", "http error 5", "unable to download video data",
+      "forbidden"),
+     "The site refused to hand over the file."),
+    (("timed out", "timeout", "unable to connect", "connection reset",
+      "temporary failure in name resolution"),
+     "The site didn't respond in time."),
+)
+
+
 def _as_download_error(e: Exception) -> DownloadError:
-    msg = str(e)
-    low = msg.lower()
-    if "login" in low or "rate-limit" in low or "private" in low:
+    # Берём последнюю строку: у yt-dlp там суть, выше — трассировка.
+    raw = str(e).splitlines()[-1].strip()
+    clean = _YTDLP_PREFIX_RE.sub("", raw)
+    low = clean.lower()
+
+    # Признак «страницы поста не было» считаем по тексту yt-dlp, а не по нашему
+    # переводу: перевод человеческий и нужных слов в нём может не остаться.
+    no_post = any(marker in low for marker in _NO_POST_MARKERS)
+
+    if any(marker in low for marker in _AUTH_MARKERS):
         return DownloadError(
-            "Couldn't download: the content is private, requires login, or hit a "
-            "rate limit (common with Instagram). Fresh cookies are needed.",
-            auth=True,
+            "This needs a login: the post is private, or the saved cookies "
+            "have expired.",
+            auth=True, no_post=no_post,
         )
-    return DownloadError(f"yt-dlp couldn't download it: {msg.splitlines()[-1]}")
+    for markers, text in _ERROR_MESSAGES:
+        if any(marker in low for marker in markers):
+            return DownloadError(text, no_post=no_post)
+
+    # Неизвестный случай — отдаём текст yt-dlp, но без служебного префикса и
+    # без простыни на пол-экрана.
+    if len(clean) > 200:
+        clean = clean[:199].rstrip() + "…"
+    return DownloadError(f"Couldn't download it: {clean}", no_post=no_post)
+
+
+# ── cookies.txt: слияние по домену ──────────────────────────────────────────
+# Экспорт из браузера делается по одному сайту, а файл у бота один на все
+# площадки. Перезапись целиком убивала бы cookies остальных сайтов, поэтому
+# новые записи вливаем поверх старых по ключу (домен, путь, имя).
+_COOKIE_HEADER = "# Netscape HTTP Cookie File\n"
+_HTTPONLY_PREFIX = "#HttpOnly_"
+
+
+def _cookie_key(line: str) -> tuple[str, str, str] | None:
+    """(домен, путь, имя) для строки Netscape-формата; None — если не запись."""
+    parts = line.rstrip("\n").split("\t")
+    if len(parts) != 7:
+        return None
+    domain = parts[0]
+    if domain.startswith(_HTTPONLY_PREFIX):
+        domain = domain[len(_HTTPONLY_PREFIX):]
+    if not domain or domain.startswith("#"):
+        return None
+    return domain.lower(), parts[2], parts[5]
+
+
+def merge_cookies_file(upload_path: str, target_path: str) -> list[str]:
+    """Вливает записи из upload_path в target_path; возвращает затронутые домены.
+
+    Пустой список = в загруженном файле нет ни одной валидной записи (прислали
+    не Netscape-формат). Рабочий файл при этом не тронут — вызывающий обязан
+    проверить результат, иначе кривой экспорт стирал бы живые cookies.
+    """
+    with open(upload_path, encoding="utf-8", errors="replace") as f:
+        incoming = [(key, line) for line in f if (key := _cookie_key(line))]
+    if not incoming:
+        return []
+
+    fresh = dict(incoming)
+    lines: list[str] = []
+    if os.path.isfile(target_path):
+        with open(target_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                key = _cookie_key(line)
+                if key is None:
+                    continue  # шапку и комментарии пересобираем сами
+                lines.append(fresh.pop(key, line))  # своё поверх старого, порядок цел
+    lines.extend(fresh.values())
+
+    # Пишем НА МЕСТО (не через rename): файл лежит на общем с Bot API server
+    # volume, и подмена инода сменила бы владельца — бот потерял бы доступ.
+    with open(target_path, "w", encoding="utf-8") as f:
+        f.write(_COOKIE_HEADER)
+        for line in lines:
+            f.write(line if line.endswith("\n") else line + "\n")
+    return sorted({key[0] for key, _ in incoming})
+
+
+# Метка в info-словаре: скачалось только анонимно, сессия в cookies.txt негодна.
+# Кладём в сам словарь, а не в глобал — скачивания идут в разных потоках.
+_STALE_COOKIES_KEY = "__videobot_threads_cookies_stale"
 
 
 def _extract_info(opts: dict, url: str) -> dict:
+    """extract_info; для Threads с cookies — с откатом на анонимную попытку."""
+    try:
+        return _extract_info_attempts(opts, url)
+    except DownloadError as e:
+        # Threads жёстко валидирует сессию: на негодную cookie он отдаёт 404 или
+        # редирект на главную для ЛЮБОЙ страницы — даже для публичного поста,
+        # который открывается анонимно (проверено: поддельный sessionid на домене
+        # threads.com роняет заведомо рабочий пост, а без него тот же пост
+        # качается). Поэтому если с cookies не вышло — пробуем ещё раз без них,
+        # иначе протухшая запись ломала бы Threads целиком.
+        #
+        # Но только на no_post (страницу поста не отдали) — это и есть симптом
+        # негодной сессии. Если пост распарсился и в нём просто нет медиа,
+        # повторять анонимно нечего: тот же ответ за вдвое больше запросов.
+        if (e.auth or not e.no_post
+                or not (is_threads(url) and opts.get("cookiefile"))):
+            raise
+        logger.info("Threads: не вышло с cookies (%s) — пробую анонимно", e)
+        try:
+            info = _extract_info_attempts({**opts, "cookiefile": None}, url)
+        except DownloadError as anon:
+            if not anon.no_post:
+                raise
+            # Ни с сессией, ни без неё страницы поста нет. Пост может быть правда
+            # закрыт/удалён, но сессия у нас есть и она не помогла — владельцу
+            # стоит проверить cookies, поэтому auth=True.
+            raise DownloadError(
+                "The site didn't hand over this post, with the saved cookies or "
+                "without them — it's deleted, or shown only to a narrower "
+                "audience than the saved session belongs to.",
+                auth=True, no_post=True,
+            ) from anon
+        # Анонимно получилось, а с cookies — нет. С рабочей сессией так не
+        # бывает: значит запись для threads.com протухла и режет доступ.
+        logger.warning("Threads: cookies протухли — без них пост открылся, с ними нет")
+        info[_STALE_COOKIES_KEY] = True
+        return info
+
+
+def _extract_info_attempts(opts: dict, url: str) -> dict:
     """extract_info с перебором impersonate-таргетов (обычно хватает первого)."""
-    candidates = _impersonate_candidates()
+    # Экстрактор Threads impersonation не просит, так что перебор таргетов там
+    # ничего не меняет — только множит запросы вчетверо (а Threads на частые
+    # запросы отвечает страницей без данных поста).
+    candidates = [None] if is_threads(url) else _impersonate_candidates()
     for attempt, target in enumerate(candidates, start=1):
         _pinned.target = target
         try:
@@ -166,7 +347,7 @@ def _extract_info(opts: dict, url: str) -> dict:
                 raise err from e
         finally:
             _pinned.target = None
-    raise DownloadError("yt-dlp couldn't download it")  # сюда не попадаем
+    raise DownloadError("Couldn't download it.")  # сюда не попадаем
 
 
 def _to_int(value: object) -> int | None:
@@ -176,7 +357,28 @@ def _to_int(value: object) -> int | None:
         return None
 
 
-def _build_opts(config: Config, out_template: str, url: str) -> dict:
+def _cookies_for_run(config: Config, work_dir: str) -> str | None:
+    """Одноразовая копия cookies.txt на время скачивания (её и скармливаем yt-dlp).
+
+    yt-dlp по завершении пишет cookie-jar ОБРАТНО в файл, и ответ площадки с
+    Set-Cookie правит рабочий файл. Для Threads это опасно: отвергнутый запрос
+    он сопровождает разлогином — и строка `sessionid` навсегда исчезает из
+    cookies.txt бота (проверено). Оригинал меняет только владелец загрузкой.
+    """
+    src = config.cookies_file
+    if not src or not os.path.isfile(src):
+        return None
+    dst = os.path.join(work_dir, "cookies.txt")
+    try:
+        shutil.copyfile(src, dst)
+        os.chmod(dst, 0o600)
+    except OSError:
+        logger.exception("Не удалось скопировать cookies — качаю без них")
+        return None
+    return dst
+
+
+def _build_opts(config: Config, out_template: str, url: str, work_dir: str) -> dict:
     opts: dict = {
         # У вертикальных видео «1080p» = 1080x1920, т.е. height=1920 — поэтому
         # ограничиваем ДЛИННУЮ сторону (<=1920), иначе height<=1080 резал их до 540p.
@@ -201,8 +403,8 @@ def _build_opts(config: Config, out_template: str, url: str) -> dict:
         opts["noplaylist"] = False
         opts["playlistend"] = 10
     # Передаём cookies только если файл реально есть (его могли ещё не загрузить).
-    if config.cookies_file and os.path.isfile(config.cookies_file):
-        opts["cookiefile"] = config.cookies_file
+    if cookies := _cookies_for_run(config, work_dir):
+        opts["cookiefile"] = cookies
     return opts
 
 
@@ -283,7 +485,7 @@ def _download_blocking(
 ) -> DownloadResult:
     # autonumber сохраняет порядок элементов карусели/слайдшоу
     out_template = os.path.join(work_dir, "%(autonumber)03d-%(id)s.%(ext)s")
-    opts = _build_opts(config, out_template, url)
+    opts = _build_opts(config, out_template, url, work_dir)
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
 
@@ -292,8 +494,8 @@ def _download_blocking(
     files = _collect_media(work_dir)
     if not files:
         raise DownloadError(
-            "Nothing was downloaded — the file may have exceeded the size limit. "
-            "Try a shorter video."
+            f"Nothing came through — the video is probably over the "
+            f"{config.max_file_size_mb} MB limit."
         )
 
     items = []
@@ -317,7 +519,7 @@ def _download_blocking(
             except OSError:
                 pass
         raise DownloadError(
-            f"The media is {total / 1024 / 1024:.1f} MB — over the "
+            f"This is {total / 1024 / 1024:.0f} MB — over the "
             f"{config.max_file_size_mb} MB limit."
         )
 
@@ -335,6 +537,7 @@ def _download_blocking(
         title=info.get("title") or "video",
         description=description,
         total_size=total,
+        cookies_stale=bool(info.get(_STALE_COOKIES_KEY)),
     )
 
 
@@ -363,7 +566,7 @@ def _download_full_blocking(
     клипы всё равно перекодируются в H.264 при нарезке.
     """
     out_template = os.path.join(work_dir, "full-%(id)s.%(ext)s")
-    opts = _build_opts(config, out_template, url)
+    opts = _build_opts(config, out_template, url, work_dir)
     opts.pop("max_filesize", None)     # целиком качаем без лимита — лимит применим к клипам
     opts["noplaylist"] = True
     opts.pop("playlistend", None)
@@ -374,7 +577,7 @@ def _download_full_blocking(
 
     videos = [f for f in _collect_media(work_dir) if os.path.splitext(f)[1].lower() in VIDEO_EXTS]
     if not videos:
-        raise DownloadError("Couldn't download the video to cut from.")
+        raise DownloadError("Couldn't download the video to cut clips from.")
     src = max(videos, key=os.path.getsize)
     return src, _probe_video(src).get("dur") or _to_int(info.get("duration"))
 
@@ -401,12 +604,12 @@ def _cut_blocking(src: str, work_dir: str, start: int, end: int, config: Config)
     try:
         subprocess.run(cmd, check=True, timeout=1800, capture_output=True)
     except Exception as e:  # noqa: BLE001
-        raise DownloadError("couldn't cut this segment") from e
+        raise DownloadError("couldn't cut this piece") from e
     if not os.path.exists(out) or os.path.getsize(out) == 0:
-        raise DownloadError("empty segment (timecodes out of range?)")
+        raise DownloadError("came out empty, the timecodes are outside the video")
     if os.path.getsize(out) > config.max_file_size_bytes:
         os.remove(out)
-        raise DownloadError(f"segment over the {config.max_file_size_mb} MB limit")
+        raise DownloadError(f"over the {config.max_file_size_mb} MB limit")
     meta = _probe_video(out)
     return MediaItem(path=out, is_video=True, width=meta.get("w"),
                      height=meta.get("h"), duration=meta.get("dur"))
